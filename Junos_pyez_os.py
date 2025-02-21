@@ -2,6 +2,8 @@ import getpass
 import re
 import time
 import subprocess
+import difflib
+import tabulate
  
 from jnpr.junos import Device
 from jnpr.junos.utils.scp import SCP
@@ -20,6 +22,7 @@ def establish_ssh_connection(hostname, username, password):
     except ConnectError as e:
         print(f"Failed to connect to {hostname}: {e}")
         return None
+   
 def validate_junos_os(dev,extracted_os):
     try:
         facts = dev.facts
@@ -42,10 +45,20 @@ def parse_interfaces_descriptions(output, regex_pattern):
         if line.startswith("name:"):
             current_interface = line.split(": ")[-1].strip()
             interfaces[current_interface] = {}
-        elif "admin status:" in line:
-            interfaces[current_interface]["admin_up"] = line.split(": ")[-1].strip().lower() == "up"
-        elif "oper status:" in line:
-            interfaces[current_interface]["link_up"] = line.split(": ")[-1].strip().lower() == "up"
+        # elif "admin status:" in line:
+        #     if  line.split(": ")[-1].strip().lower() == "up":
+        #         interfaces[current_interface]["admin_up"] = line.split(": ")[-1].strip().lower() == "up"
+        #     else:
+        #         interfaces[current_interface]["admin_up"] = False
+        # elif "oper status:" in line:
+        #     if line.split(": ")[-1].strip().lower() == "up":
+        #         interfaces[current_interface]["link_up"] = line.split(": ")[-1].strip().lower() == "up"
+        #     else:
+        #         interfaces[current_interface]["link_up"] = False
+        elif "admin status:" in line or "oper status:" in line:
+            status = line.split(": ")[-1].strip().lower()
+            key = "admin_up" if "admin status:" in line else "link_up"
+            interfaces[current_interface][key] = status == "up"
         elif "description:" in line:
             description = line.split(": ")[-1].strip()
             interfaces[current_interface]["description"] = description
@@ -55,15 +68,11 @@ def parse_interfaces_descriptions(output, regex_pattern):
  
 def checks(dev, check_commands):
     check_output = ""
-    print(" Pre-checks completed for below commands:")
     for cmd in check_commands:
         try:
             print(cmd['description'])
-            if cmd['method'] == 'cli':
-                output = dev.cli(cmd['args']['command'])
-            else:
-                rpc_method = getattr(dev.rpc, cmd['method'])
-                output = rpc_method(**cmd.get('args', {}))
+            rpc_method = getattr(dev.rpc, cmd['method'])
+            output = rpc_method(**cmd.get('args', {}))
  
             if output is None:
                 text_output = "No data available"
@@ -129,7 +138,7 @@ def upgrade_firmware(dev, firmware_path):
     try:
         # Initialize the software utility
         sw = SW(dev)
-        # remote_package=f"/var/tmp/{firmware_path}"
+ 
         print("Starting firmware upgrade...")
         # Perform os upgrade
         result = sw.install(package=firmware_path,
@@ -139,7 +148,7 @@ def upgrade_firmware(dev, firmware_path):
         # Check installation result
         if result:
             print("Firmware install was successful.\nThe system is going to Reboot")      
-            sw.reboot()  
+            dev.rpc.request_reboot()  
         else:
             print("Software upgrade failed.")
             return False
@@ -163,9 +172,6 @@ def is_device_reachable(hostname):
  
 def extract_text_from_xml(xml_element):
     """Extracts relevant information from an XML element and formats it as readable text."""
-    if isinstance(xml_element, bool):  # ✅ Handle boolean responses
-        return "Success" if xml_element else "Failed"
- 
     output = []
     for element in xml_element.iter():
         if element.tag is not None and element.text is not None:
@@ -176,67 +182,36 @@ def extract_text_from_xml(xml_element):
  
     return "\n".join(output)
  
-def compare_files(pre_data, post_data):
+def compare_files(pre_data, post_data,check_commands):
     """Compare pre-check and post-check data."""
-    changes = []
-    max_lines = max(len(pre_data), len(post_data))
  
-    for i in range(max_lines):
-        pre_line = pre_data[i] if i < len(pre_data) else ""
-        post_line = post_data[i] if i < len(post_data) else ""
-       
-        if pre_line != post_line:
-            changes.append((pre_line, post_line))
-   
+    # Get differences using difflib
+    delta = list(difflib.Differ().compare(pre_data.splitlines(), post_data.splitlines()))
+ 
+    # Prepare old and new changes with alignment
+    old_changes, new_changes = [], []
+    for line in delta:
+        if any(cmd['description'] in line for cmd in check_commands): # for printing show commands in the table
+            old_changes.extend(['',line,''])
+            #old_changes.append('')  
+            #old_changes.append(line)
+            #old_changes.append('')
+            new_changes.extend(['','',line])
+            # new_changes.append('')
+            # new_changes.append('')
+            # new_changes.append(line)
+ 
+        elif line.startswith("- "): # for printing the changes in pre_comands
+            old_changes.append(line[1:])
+            new_changes.append("")
+ 
+        elif line.startswith("+ "):       # for printing the changes in post_commands
+            new_changes.append(line[1:])
+            old_changes.append("")
+    # Print the table
+    changes = tabulate(list(zip(old_changes,new_changes[1:])), headers=["Pre_check (-)", "Post_check (+)"], tablefmt="grid")
+ 
     return changes
- 
-def extract_info(file_content):
-    """Extract all relevant information from the file content."""
-    return file_content.splitlines()
- 
-def wrap_text(text, width):
-    """Wrap text to fit within a specified width."""
-    lines = []
-    while len(text) > width:
-        # Find the last space within the width
-        split_index = text[:width].rfind(" ")
-        if split_index == -1:  # No spaces found, split at width
-            split_index = width
-        lines.append(text[:split_index].strip())
-        text = text[split_index:].strip()
-    lines.append(text)  # Add the remaining text
-    return lines
- 
-def save_table_to_file(changes, output_file):
-    """Save changes in a table format to a file with text wrapping."""
-    col_width = 50
-    table_width = 2 * col_width + 7  # Includes borders and separator
- 
-    with open(output_file, "w") as f:
-        # Write top border
-        f.write("+" + "-" * (table_width - 2) + "+\n")
- 
-        # Write header row
-        header = f"| {'Pre-Check':<{col_width}} | {'Post-Check':<{col_width}} |\n"
-        f.write(header)
-        f.write("+" + "-" * (table_width - 2) + "+\n")
- 
-        # Write data rows with text wrapping
-        for pre, post in changes:
-            pre_lines = wrap_text(pre, col_width)
-            post_lines = wrap_text(post, col_width)
-            max_lines = max(len(pre_lines), len(post_lines))
- 
-            for i in range(max_lines):
-                pre_line = pre_lines[i] if i < len(pre_lines) else ""
-                post_line = post_lines[i] if i < len(post_lines) else ""
-                f.write(f"| {pre_line:<{col_width}} | {post_line:<{col_width}} |\n")
- 
-        # Write bottom border
-        f.write("+" + "-" * (table_width - 2) + "+\n")
- 
-    print(f"Comparison saved to {output_file}")
- 
  
 def main():
     username = input("Enter your username: ")
@@ -276,14 +251,11 @@ def main():
         return
  
     # Step 1: Fetch interface descriptions
-    # print("Fetching interface descriptions...")
     interface_output = checks(dev,[check_commands[4]])
     interfaces_status = parse_interfaces_descriptions(interface_output, uplink_regex)
     uplink_candidates = [intf for intf, details in interfaces_status.items() if details["is_uplink"]]
     active_uplinks = [intf for intf in uplink_candidates if (interfaces_status[intf]["admin_up"] and interfaces_status[intf]["link_up"])]
  
-    # print(interfaces_status)
-    # print(f"Total links: {len(interfaces_status)}")
     print(f"Total uplinks: {len(uplink_candidates)}")
     print(f"Active uplinks: {len(active_uplinks)}")
  
@@ -292,10 +264,11 @@ def main():
             print("Exiting. Resolve issues before retrying.")
             dev.close()
             return
+       
     # Step 2: Pre-check commands
+    print(" Pre-checks completed for below commands:")
     pre_check_output = checks(dev,check_commands)
     save_output_to_file("pre_check.txt", pre_check_output)
-    print("Pre-checks completed.")
  
     for firmware_path, expected_md5 in firmware_md5.items():
         # Step 3: Copy and validate firmware
@@ -314,7 +287,7 @@ def main():
         print("Waiting for device to come online...")
         time.sleep(300)
         while not is_device_reachable(target_device):
-            print("Device is not reachable. Retrying in 30 seconds...")
+            print("Device is not reachable. Upgrade in Progress...")
             time.sleep(30)
  
         print("Device is back online. Reconnecting...")
@@ -324,16 +297,16 @@ def main():
             return
  
     # Step 6: Post-checks
+    print(" Post-checks completed for below commands:")
     post_check_output = checks(dev,check_commands)
     save_output_to_file("post_check.txt", post_check_output)
-    print("Post-checks completed.")
+ 
  
     # Step 7: Compare pre-check and post-check
-    changes = compare_files(extract_info(pre_check_output), extract_info(post_check_output))
-    save_table_to_file(changes, "version_comparison.txt")
+    changes = compare_files(pre_check_output,post_check_output,check_commands)
+    save_output_to_file(changes, "version_comparison.txt")
  
     print("Upgrade process completed successfully.")
  
 if __name__ == "__main__":
     main()
- 
